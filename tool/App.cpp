@@ -93,6 +93,10 @@ void App::useProject(const std::string& directory) {
     m_reports.clear();
     select(-1);
     refresh();
+    m_results.clear();
+    m_mp = {};
+    m_testSelected.clear();
+    refreshScenarios();
 }
 
 void App::refresh() {
@@ -144,7 +148,11 @@ void App::setStatus(const std::string& text, bool error) {
 
 void App::frame(double dt) {
     m_sinceScan += dt;
-    if (m_sinceScan >= kScanSeconds && m_project.valid) refresh();
+    if (m_sinceScan >= kScanSeconds && m_project.valid) {
+        refresh();
+        refreshScenarios();
+    }
+    pollJobs();
 
     const ImGuiViewport* viewport = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(viewport->WorkPos);
@@ -153,6 +161,19 @@ void App::frame(double dt) {
                  ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBringToFrontOnFocus);
     drawTop();
     ImGui::Separator();
+    if (ImGui::BeginTabBar("##pages")) {
+        if (ImGui::BeginTabItem(tr("Reports"))) {
+            m_testsPage = false;
+            ImGui::EndTabItem();
+        }
+        const std::string testsLabel = trf("Tests (%u)", static_cast<unsigned>(m_scenarios.size())) + "###tests";
+        if (ImGui::BeginTabItem(testsLabel.c_str(), nullptr, m_selectTests ? ImGuiTabItemFlags_SetSelected : 0)) {
+            m_testsPage = true;
+            ImGui::EndTabItem();
+        }
+        m_selectTests = false;
+        ImGui::EndTabBar();
+    }
     const float statusHeight = ImGui::GetFrameHeightWithSpacing();
     if (ImGui::BeginTable("##split", 2, ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV,
                           ImVec2(0, ImGui::GetContentRegionAvail().y - statusHeight))) {
@@ -160,9 +181,11 @@ void App::frame(double dt) {
         ImGui::TableSetupColumn("detail", ImGuiTableColumnFlags_WidthStretch, 0.62f);
         ImGui::TableNextRow();
         ImGui::TableNextColumn();
-        drawList();
+        if (m_testsPage) drawTests();
+        else drawList();
         ImGui::TableNextColumn();
-        drawDetail();
+        if (m_testsPage) drawTestDetail();
+        else drawDetail();
         ImGui::EndTable();
     }
     ImGui::Separator();
@@ -194,6 +217,7 @@ void App::drawTop() {
     }
     ImGui::SameLine();
     if (ImGui::Button(tr("Open Folder")) && !m_folder.empty()) SDL_OpenURL(("file:///" + m_folder).c_str());
+    if (m_testsPage) return; // the filters below are for the report list
     ImGui::SameLine();
     ImGui::Checkbox(tr("Bug reports"), &m_showBug);
     ImGui::SameLine();
@@ -263,6 +287,12 @@ void App::drawDetail() {
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
         ImGui::SetTooltip("%s", playable ? tr("Plays the recording in the editor and pauses where the report was made")
                                          : tr("This report has no input recording (made outside a match)"));
+    ImGui::SameLine();
+    ImGui::BeginDisabled(!playable);
+    if (ImGui::Button(tr("Save as Scenario"))) saveAsScenario(r);
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip("%s", tr("Turns the recording into a scenario test in the project's tests/ folder, with every state value at the report's tick as checks. Keep the checks that show the bug."));
     ImGui::SameLine();
     if (ImGui::Button(tr("Copy Info"))) {
         SDL_SetClipboardText(r.summaryText().c_str());
@@ -381,6 +411,208 @@ void App::openInEditor(const Report& report) {
     }
     SDL_DestroyProcess(process); // keeps running
     setStatus(trf("Opened %s in the editor", report.entry.name.c_str()), false);
+}
+
+namespace {
+
+const char* stateLabel(ScenarioResult::State state) {
+    switch (state) {
+    case ScenarioResult::State::NotRun: return tr("not run");
+    case ScenarioResult::State::Running: return tr("running");
+    case ScenarioResult::State::Passed: return tr("passed");
+    case ScenarioResult::State::Failed: return tr("failed");
+    }
+    return "?";
+}
+
+ImVec4 stateColor(ScenarioResult::State state) {
+    switch (state) {
+    case ScenarioResult::State::Passed: return ImVec4(0.45f, 0.85f, 0.45f, 1.0f);
+    case ScenarioResult::State::Failed: return ImVec4(1.0f, 0.45f, 0.45f, 1.0f);
+    case ScenarioResult::State::Running: return ImVec4(0.95f, 0.75f, 0.30f, 1.0f);
+    case ScenarioResult::State::NotRun: break;
+    }
+    return ImVec4(0.6f, 0.6f, 0.6f, 1.0f);
+}
+
+std::string baseName(const std::string& path) { return mkcontract::utf8Of(mkcontract::pathOf(path).stem()); }
+
+void outputBox(const char* id, const std::string& text) {
+    ImGui::InputTextMultiline(id, const_cast<char*>(text.c_str()), text.size() + 1, ImVec2(-1, -1), ImGuiInputTextFlags_ReadOnly);
+}
+
+} // namespace
+
+void App::refreshScenarios() { m_scenarios = m_project.valid ? listScenarios(m_project) : std::vector<std::string>(); }
+
+bool App::needBuild(const std::string& exe) {
+    if (!exe.empty()) return false;
+    setStatus(trf("Build the game first (build.bat in %s): no executables in build\\Release\\bin", buildRoot(m_project).c_str()), true);
+    return true;
+}
+
+void App::runScenario(const std::string& file, bool updateExpected) {
+    const std::string headless = headlessExe(m_project);
+    if (needBuild(headless)) return;
+    ScenarioResult& r = m_results[file];
+    r = {};
+    r.state = ScenarioResult::State::Running;
+    m_scenarioJobs[m_runner.add(scenarioArgs(headless, file, updateExpected))] = file;
+}
+
+void App::runMpTest() {
+    if (needBuild(gameExe(m_project))) return;
+    m_mp = {};
+    m_mp.line = tr("running...");
+    m_mpJob = m_runner.add(mpTestArgs(m_project, static_cast<uint32_t>(m_mpClients), static_cast<uint32_t>(m_mpTicks)));
+    m_testSelected = "mp_test";
+}
+
+void App::pollJobs() {
+    for (Runner::Job& job : m_runner.takeFinished()) {
+        if (job.id == m_mpJob) {
+            m_mp = parseMpTestOutput(job.output, job.exitCode);
+            m_mpJob = 0;
+            continue;
+        }
+        const auto it = m_scenarioJobs.find(job.id);
+        if (it == m_scenarioJobs.end()) continue;
+        m_results[it->second] = parseScenarioOutput(job.output, job.exitCode);
+        m_scenarioJobs.erase(it);
+    }
+}
+
+void App::saveAsScenario(const Report& report) {
+    if (needBuild(headlessExe(m_project))) return;
+    std::string path, error;
+    if (!writeScenarioFromReport(report, m_project, path, error)) {
+        setStatus(trf("Cannot save the scenario: %s", error.c_str()), true);
+        return;
+    }
+    runScenario(path, true); // writes the checks
+    refreshScenarios();
+    m_testSelected = path;
+    m_selectTests = true;
+    setStatus(trf("Saved tests/%s.scenario. Keep the checks that show the bug.", baseName(path).c_str()), false);
+}
+
+void App::drawTests() {
+    if (!m_project.valid) {
+        ImGui::TextWrapped("%s", tr("Pick a game. MealKit QA lists the projects you opened in the editor."));
+        return;
+    }
+    ImGui::BeginDisabled(m_scenarios.empty());
+    if (ImGui::Button(tr("Run All")))
+        for (const std::string& f : m_scenarios) runScenario(f, false);
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    ImGui::BeginDisabled(!m_runner.busy());
+    if (ImGui::Button(tr("Stop"))) {
+        m_runner.cancelPending();
+        for (auto& [id, file] : m_scenarioJobs)
+            if (m_results[file].state == ScenarioResult::State::Running) m_results[file].state = ScenarioResult::State::NotRun;
+    }
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("%s", tr("Cancels the waiting runs (the running one finishes)"));
+    unsigned passed = 0, failed = 0;
+    for (const std::string& f : m_scenarios) {
+        const auto it = m_results.find(f);
+        if (it == m_results.end()) continue;
+        passed += it->second.state == ScenarioResult::State::Passed;
+        failed += it->second.state == ScenarioResult::State::Failed;
+    }
+    ImGui::SameLine();
+    ImGui::TextDisabled("%s", trf("%u passed, %u failed", passed, failed).c_str());
+
+    if (m_scenarios.empty())
+        ImGui::TextWrapped("%s", tr("No scenario tests in tests/. Save one from a report ([Save as Scenario]) or from editor play."));
+    else if (ImGui::BeginTable("##scenarios", 2, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_BordersInnerH,
+                               ImVec2(0, ImGui::GetContentRegionAvail().y - ImGui::GetFrameHeightWithSpacing() * 4.0f))) {
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableSetupColumn(tr("Scenario"), ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn(tr("Result"), ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 7.0f);
+        ImGui::TableHeadersRow();
+        for (const std::string& f : m_scenarios) {
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::PushID(f.c_str());
+            if (ImGui::Selectable(baseName(f).c_str(), m_testSelected == f, ImGuiSelectableFlags_SpanAllColumns)) m_testSelected = f;
+            if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) runScenario(f, false);
+            ImGui::PopID();
+            ImGui::TableNextColumn();
+            const auto it = m_results.find(f);
+            const ScenarioResult::State state = it == m_results.end() ? ScenarioResult::State::NotRun : it->second.state;
+            ImGui::TextColored(stateColor(state), "%s", stateLabel(state));
+        }
+        ImGui::EndTable();
+    }
+
+    ImGui::SeparatorText(tr("Multiplayer test (mp_test)"));
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 6);
+    ImGui::InputInt(tr("clients"), &m_mpClients);
+    m_mpClients = std::clamp(m_mpClients, 1, 7);
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 7);
+    ImGui::InputInt(tr("ticks"), &m_mpTicks, 300);
+    m_mpTicks = std::clamp(m_mpTicks, 60, 100000);
+    ImGui::SameLine();
+    ImGui::BeginDisabled(m_mpJob != 0);
+    if (ImGui::Button(tr("Run mp_test"))) runMpTest();
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip("%s", tr("Host + clients with bot input on this PC, headless: passes when every peer has the same state hash"));
+    if (!m_mp.line.empty()) {
+        const ScenarioResult::State state = m_mpJob != 0 ? ScenarioResult::State::Running
+                                            : m_mp.passed ? ScenarioResult::State::Passed
+                                                          : ScenarioResult::State::Failed;
+        ImGui::PushStyleColor(ImGuiCol_Text, stateColor(state));
+        if (ImGui::Selectable(m_mp.line.c_str(), m_testSelected == "mp_test")) m_testSelected = "mp_test";
+        ImGui::PopStyleColor();
+    }
+}
+
+void App::drawTestDetail() {
+    if (m_testSelected == "mp_test") {
+        ImGui::TextUnformatted(m_mp.line.c_str());
+        outputBox("##mpout", m_mp.output);
+        return;
+    }
+    if (m_testSelected.empty()) {
+        ImGui::TextDisabled("%s", tr("Pick a scenario. Double-click runs it."));
+        return;
+    }
+    const std::string f = m_testSelected;
+    const auto it = m_results.find(f);
+    const ScenarioResult r = it == m_results.end() ? ScenarioResult{} : it->second;
+    ImGui::TextUnformatted(baseName(f).c_str());
+    ImGui::SameLine();
+    ImGui::TextColored(stateColor(r.state), "%s", stateLabel(r.state));
+    if (r.state == ScenarioResult::State::Passed || r.state == ScenarioResult::State::Failed) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("%s", trf("%u check(s), %u failed", r.checks, r.failed).c_str());
+    }
+    ImGui::BeginDisabled(r.state == ScenarioResult::State::Running);
+    if (ImGui::Button(tr("Run"))) runScenario(f, false);
+    ImGui::SameLine();
+    if (ImGui::Button(tr("Update Expected"))) runScenario(f, true);
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip("%s", tr("Rewrites the == values in the file with the current results (when the rules changed on purpose)"));
+    ImGui::SameLine();
+    if (ImGui::Button(tr("Show File"))) SDL_OpenURL(("file:///" + folderOf(f)).c_str());
+    for (const std::string& line : r.failures) ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.45f, 1.0f), "%s", line.c_str());
+    if (!ImGui::BeginTabBar("##testtabs")) return;
+    if (ImGui::BeginTabItem(tr("File"))) {
+        std::string text;
+        mkcontract::readFile(f, text);
+        outputBox("##file", text);
+        ImGui::EndTabItem();
+    }
+    if (!r.output.empty() && ImGui::BeginTabItem(tr("Output"))) {
+        outputBox("##out", r.output);
+        ImGui::EndTabItem();
+    }
+    ImGui::EndTabBar();
 }
 
 } // namespace mkqa::tool

@@ -1,9 +1,11 @@
 // mkqa tests: zip reading, recordings, the report list and reports, projects. Builds a fake game folder in the temp folder.
 #include "Strings.h"
 #include "mkqa/Reports.h"
+#include "mkqa/Tests.h"
 
 #include <mkcontract/Files.h>
 
+#include <algorithm>
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
@@ -233,6 +235,82 @@ void testProject(const fs::path& root) {
     CHECK(fs::path(gameFolder("")).filename() == "MealKitGame" || std::getenv("MEALKIT_GAME_DIR"));
 }
 
+void testTests(const fs::path& root) {
+    // Build root: a project with build.bat, an engine sample (samples/<name> of a repo with engine/src/mealkit), else the folder
+    const fs::path engine = root / "eng";
+    write(engine / "build.bat", bytes("x"));
+    write(engine / "engine" / "src" / "mealkit" / "x.h", bytes("x"));
+    write(engine / "samples" / "demo" / "mealkit.project", bytes("name demo\n"));
+    Project sample;
+    CHECK(readProject(str(engine / "samples" / "demo"), sample));
+    CHECK(mkcontract::sameDirectory(buildRoot(sample), str(engine)));
+    CHECK(headlessExe(sample).empty());
+#if defined(_WIN32)
+    write(engine / "build" / "Release" / "bin" / "demo_headless.exe", bytes("x"));
+#else
+    write(engine / "build" / "Release" / "bin" / "demo_headless", bytes("x"));
+#endif
+    CHECK(!headlessExe(sample).empty());
+    const std::vector<std::string> mp = mpTestArgs(sample, 3, 900);
+    CHECK(mp.size() > 6 && mp[mp.size() - 1] == "900" && mp[mp.size() - 3] == "3");
+    CHECK(mp.end() != std::find_if(mp.begin(), mp.end(), [&](const std::string& a) {
+              return mkcontract::sameDirectory(fs::path(a).parent_path().parent_path().string(), str(engine));
+          })); // the engine's tools/mp_test.ps1
+    Project plain;
+    write(root / "plain" / "mealkit.project", bytes("name plain\n"));
+    CHECK(readProject(str(root / "plain"), plain) && mkcontract::sameDirectory(buildRoot(plain), plain.directory));
+
+    // Scenario list and output
+    write(engine / "samples" / "demo" / "tests" / "b.scenario", bytes("tick 1 x == 1\n"));
+    write(engine / "samples" / "demo" / "tests" / "a.scenario", bytes("tick 1 x == 1\n"));
+    write(engine / "samples" / "demo" / "tests" / "a.rec", bytes("x"));
+    const std::vector<std::string> list = listScenarios(sample);
+    CHECK(list.size() == 2 && fs::path(list[0]).filename() == "a.scenario");
+    ScenarioResult r = parseScenarioOutput("[ 0.1][WARN ] x\nSCENARIO ok a.scenario checks=4\n", 0);
+    CHECK(r.state == ScenarioResult::State::Passed && r.checks == 4 && r.failures.empty());
+    r = parseScenarioOutput("SCENARIO FAIL a.scenario:3 tick 5 x == 1 (got 2)\nSCENARIO FAIL a.scenario failed=1/4\n", 6);
+    CHECK(r.state == ScenarioResult::State::Failed && r.checks == 4 && r.failed == 1 && r.failures.size() == 1);
+    CHECK(r.failures.size() == 1 && r.failures[0] == "a.scenario:3 tick 5 x == 1 (got 2)");
+    r = parseScenarioOutput("[ERROR] scene not found\n", 1);
+    CHECK(r.state == ScenarioResult::State::Failed && r.failures.size() == 1);
+    CHECK(scenarioArgs("h", "a", true).back() == "--update-expected" && scenarioArgs("h", "a", false).size() == 3);
+    MpTestResult m = parseMpTestOutput("x\nPASS: 4 peers identical after 900 ticks\n", 0);
+    CHECK(m.passed && m.line == "PASS: 4 peers identical after 900 ticks");
+    m = parseMpTestOutput("FAIL: see build\\mp_test\n", 1);
+    CHECK(!m.passed && m.line == "FAIL: see build\\mp_test");
+
+    // Report → scenario: the recording copied next to it, inputs/ticks/scene lines, no checks (the engine's --update-expected adds them)
+    const fs::path game = root / "game2";
+    write(game / "bugreports" / "2026-11-02_10-00.zip",
+          zip({{"info.txt", bytes("# MealKit bug report\nscene = scenes/arena.scene\nnote = stuck\ntick = 40\n")},
+               {"replay.rec", recording(1, 3, 41)}}));
+    write(game / "replays" / "2026-11-02_11-00.rec", recording(2, 4, 90));
+    const std::vector<Entry> entries = listEntries(str(game));
+    CHECK(entries.size() == 2);
+    for (const Entry& e : entries) {
+        Report report;
+        CHECK(loadReport(e, report));
+        std::string path, error;
+        CHECK(writeScenarioFromReport(report, sample, path, error));
+        std::string text;
+        CHECK(mkcontract::readFile(path, text));
+        const std::string name = std::string(kindName(e.kind)) + "_" + e.name;
+        CHECK(fs::path(path).filename() == name + ".scenario");
+        CHECK(text.find("inputs " + name + ".rec\n") != std::string::npos);
+        CHECK(text.find("\ntick ") == std::string::npos);
+        if (e.kind == Kind::Bug) CHECK(text.find("ticks 41\n") != std::string::npos && text.find("scene scenes/arena.scene\n") != std::string::npos);
+        else CHECK(text.find("ticks ") == std::string::npos);
+        std::vector<uint8_t> rec;
+        std::ifstream in(fs::path(path).replace_extension(".rec"), std::ios::binary);
+        rec.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+        CHECK(readRecording(rec).valid);
+        CHECK(!writeScenarioFromReport(report, sample, path, error)); // already there
+    }
+    Report empty;
+    std::string path, error;
+    CHECK(!writeScenarioFromReport(empty, sample, path, error));
+}
+
 // Whether all tr("...")/trf("...") text in tool/App.cpp is in the Korean table
 void testTranslations() {
     std::ifstream in(fs::path(MKQA_SOURCE_DIR) / "tool" / "App.cpp", std::ios::binary);
@@ -270,6 +348,7 @@ int main() {
     testZip(root);
     testReports(root);
     testProject(root);
+    testTests(root);
     testTranslations();
     fs::remove_all(root, ec);
     if (g_failures) {

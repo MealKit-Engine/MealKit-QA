@@ -4,7 +4,7 @@
 #   cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build build && ctest --test-dir build
 #   cmake --install build --prefix "%LOCALAPPDATA%\MealKit\tools\qa"   (the editor's [Tools] menu finds it there)
 cmake_minimum_required(VERSION 3.25)
-project(mkqa VERSION 0.1.0 LANGUAGES C CXX)
+project(mkqa VERSION 0.2.0 LANGUAGES C CXX)
 
 option(MKQA_BUILD_TOOL "Build the MealKitQA window (SDL3 + Dear ImGui)" ON)
 
@@ -13,7 +13,7 @@ set(MKCONTRACT_BUILD_TESTS OFF)
 add_subdirectory(third_party/mkcontract)
 
 # Data layer (no window, used by tests)
-add_library(mkqa STATIC include/mkqa/Reports.h src/Reports.cpp src/Strings.h src/Strings.cpp)
+add_library(mkqa STATIC include/mkqa/Reports.h src/Reports.cpp include/mkqa/Tests.h src/Tests.cpp src/Strings.h src/Strings.cpp)
 target_include_directories(mkqa PUBLIC include src)
 target_link_libraries(mkqa PUBLIC mkcontract)
 target_compile_features(mkqa PUBLIC cxx_std_20)
@@ -38,7 +38,7 @@ if(MKQA_BUILD_TOOL)
         target_compile_options(mkqa_imgui PRIVATE /utf-8)
     endif()
 
-    add_executable(MealKitQA WIN32 tool/main.cpp tool/App.h tool/App.cpp)
+    add_executable(MealKitQA WIN32 tool/main.cpp tool/App.h tool/App.cpp tool/Runner.h tool/Runner.cpp)
     target_link_libraries(MealKitQA PRIVATE mkqa mkqa_imgui SDL3::SDL3-static)
     target_compile_definitions(MealKitQA PRIVATE MKQA_VERSION="${PROJECT_VERSION}")
     set_target_properties(MealKitQA PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
