@@ -2,6 +2,8 @@
 
 A QA tool for games made with the [MealKit engine](https://github.com/MealKit-Engine/MealKit). It shows a game's bug reports, crash reports and replays in one list and opens any of them in the MealKit editor, which plays the recording and pauses where the report was made. It also runs the project's scenario tests and the engine's multiplayer test, and turns a report into a scenario test.
 
+> **Beta (v0.x).** MealKit is under active development: APIs and file formats may change between versions until v1.0, and projects are moved forward with the upgrade tool. Feedback and bug reports are welcome.
+
 C++20, SDL3 + Dear ImGui (the same framework as MealKit Audio and MealKit Manager). MIT license.
 
 ## What it reads
@@ -37,6 +39,14 @@ build.bat install    :: also copy to %LOCALAPPDATA%\MealKit\tools\qa (the editor
 Other systems: `cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build build && ctest --test-dir build`.
 
 Command line: `MealKitQA [--project <folder>] [--select <report name>] [--tests] [--lang ko|en]`. Without a window: `--list` prints the reports, `--run-tests [--mp-test]` runs the scenarios (and mp_test) and exits with 1 on a failure, `--make-scenario <report name>` does Save as Scenario.
+
+## Working on it
+
+- It doesn't link the engine: it reads only the files a game writes and starts the editor, the game's headless build and `tools/mp_test.ps1` by command line.
+- The file formats copy the engine's (`core/Zip.cpp`, `game/InputRecord.cpp`, `game/BugReport.cpp`, `game/ProjectSettings.cpp`) and the test runs read its output lines (`SCENARIO ok/FAIL`, `PASS:`/`FAIL:`); when the engine changes one, `src/Reports.cpp` or `src/Tests.cpp` and their tests change with it.
+- The user folder and project lists come from [MealKit-Contract](https://github.com/MealKit-Engine/MealKit-Contract) (`third_party/mkcontract`). SDL and Dear ImGui stay at the same versions as MealKit Audio and MealKit Manager.
+- Data is in `src/` (no window, under test: `build\mkqa_tests.exe`), the screen in `tool/`. Screen text is English in `tr("...")` with Korean in `src/Strings.cpp`; the tests catch missing entries.
+- Contributing: see the [MealKit contributing guide](https://github.com/MealKit-Engine/.github/blob/main/CONTRIBUTING.md).
 
 ## Third-party code
 
